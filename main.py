@@ -42,8 +42,55 @@ def main():
     parser.add_argument('--speed_weight', type=float, default=1.0,
                         help='Preference for high predicted speed at the chosen frontier '
                              '(open space). 0 = ignore speed.')
-    
+    #! MULTI-AGENT -------------------------------------------------------
+    parser.add_argument('--n_agents', type=int, default=2,
+                        help='Number of robots exploring the SAME map with the '
+                             'SAME network. 1 reproduces the original '
+                             'single-agent behaviour exactly.')
+    parser.add_argument('--starts', type=float, nargs='*', default=None,
+                        metavar='C',
+                        help='Flat list of 3*n_agents start coordinates, e.g. '
+                             '--starts -0.3 -0.2 0  0.3 0.2 0. Must be inside '
+                             '-0.5..0.5 AND in free space. Omit to spread the '
+                             'agents evenly round the circle through the '
+                             "paper's start point.")
+    parser.add_argument('--sep_weight', type=float, default=0.0,
+                        help='Penalty for picking a frontier near ANOTHER '
+                             'agent. 0 = off (the assignment already stops two '
+                             'agents sharing a frontier). Try 0.1-0.5 if the '
+                             'agents trail each other.')
+    parser.add_argument('--sep_sigma', type=float, default=0.15,
+                        help='Length scale of the separation penalty.')
+    parser.add_argument('--coverage_limit', type=float, default=0.543,
+                        help='Stop once combined coverage exceeds this. '
+                             'Scene-specific safety net.')
+    parser.add_argument('--no_fair_budget', action='store_true',
+                        help='Give each agent the full frame budget instead of '
+                             'holding TOTAL sensing actions constant. Off by '
+                             'default so an N-agent run is comparable with '
+                             '--baseline rather than just getting N times the '
+                             'sensor budget.')
+    #! A/B comparison ----------------------------------------------------
+    parser.add_argument('--baseline', action='store_true',
+                        help='Disable every Xe behaviour (frontier ranking, '
+                             'approach phase, speed shaping) and terminate on '
+                             'coverage only - the original paper logic.')
+    parser.add_argument('--use_slowdown', action='store_true',
+                        help='Enable the deceleration zone around Xe once a '
+                             'route exists.')
+
     args = parser.parse_args()
+
+    #! Validate the start positions before any expensive setup.
+    starts = args.starts
+    if starts is not None and len(starts) > 0:
+        if len(starts) != 3 * args.n_agents:
+            parser.error(
+                '--starts needs exactly {} values for {} agents (3 per agent), '
+                'got {}'.format(3 * args.n_agents, args.n_agents, len(starts)))
+        starts = np.asarray(starts, dtype=np.float32).reshape(args.n_agents, 3)
+    else:
+        starts = None
 
     # Set the mode based on the --no_explore flag
     if args.no_explore:
@@ -74,7 +121,15 @@ def main():
                      enemy_s_min=args.enemy_s_min,
                      search_weight=args.search_weight,
                      arrival_radius=args.arrival_radius,
-                     speed_weight=args.speed_weight)
+                     speed_weight=args.speed_weight,
+                     baseline=args.baseline,
+                     use_slowdown=args.use_slowdown,
+                     n_agents=args.n_agents,
+                     starts=starts,
+                     sep_weight=args.sep_weight,
+                     sep_sigma=args.sep_sigma,
+                     coverage_limit=args.coverage_limit,
+                     fair_budget=not args.no_fair_budget)
     model.train()
 
 if __name__ == '__main__':

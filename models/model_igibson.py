@@ -264,12 +264,63 @@ class NN(torch.nn.Module):
     #     return output, coords
 
 
+#! MULTI-AGENT ------------------------------------------------------------
+#! One Agent per robot. Everything the ROBOT owns lives here; everything the
+#! WORLD owns (network, occupancy map, frame buffer, Xe) stays on Model and is
+#! shared by every agent.
+#!
+#! This is a centralised-information / per-agent-planning split:
+#!   * ONE PINN, because it learns the environment's speed field S(x) - a
+#!     property of the scene, not of any robot. Training N networks on 1/N of
+#!     the frames each would give N worse models of the same house, and the
+#!     active-learning premise in train_core (20-frame buffer, cross-frame
+#!     point mixing in randomize_data) depends on POOLING observations.
+#!   * ONE occupancy map, which makes combined coverage automatic: the shared
+#!     map IS the union of what every agent has seen, so get_coverage() needs
+#!     no merge step at all.
+#!   * Per-agent position and trajectory, with an explicit frontier ASSIGNMENT
+#!     step so two agents never claim the same frontier (without it both score
+#!     frontiers identically and the second agent is pure waste).
+#! ------------------------------------------------------------------------
+class Agent:
+    def __init__(self, agent_id, start):
+        self.id = int(agent_id)
+        self.start = np.asarray(start, dtype=np.float32).reshape(-1)
+        self.cur_view = Tensor(self.start.copy())
+        #! path actually walked so far (for plotting / analysis)
+        self.trajectory = None
+        #! the plan for the current frame
+        self.traj_list = None
+        self.traj_ind = 0
+        self.nbv = None
+        #! retired: no frontier left anywhere for this agent to claim
+        self.done = False
+        #! this agent physically reached Xe -> mission over for everyone
+        self.reached = False
+        #! still active, but no free frontier this particular frame
+        self.idle = False
+        #! consecutive idle frames; retire after Model.idle_limit of them
+        self.idle_count = 0
+
+    def pos(self):
+        return self.cur_view.detach().clone().cpu().numpy()
+
+    def __repr__(self):
+        p = self.pos()
+        return "<Agent {} at [{:.3f}, {:.3f}, {:.3f}]{}{}>".format(
+            self.id, p[0], p[1], p[2],
+            " DONE" if self.done else "",
+            " REACHED" if self.reached else "")
+
+
 class Model():
     def __init__(self, ModelPath, dim, scale_factor, mode, Xe, renderer=None,
                  device='cpu', enemy_d_slow=0.30, enemy_s_min=0.30,
                  speed_floor=0.09, allow_origin_Xe=False,
                  search_weight=2.0, arrival_radius=0.0005, speed_weight=0.0,
-                 use_slowdown=False, baseline=False):
+                 use_slowdown=False, baseline=False,
+                 n_agents=1, starts=None, sep_weight=0.0, sep_sigma=0.15,
+                 coverage_limit=0.543, fair_budget=True):
         #! Xe CHANGE: the fixed target location is a REQUIRED argument and is
         #! validated immediately. There is no setter and no default: execution
         #! cannot begin until a valid in-bounds coordinate is supplied, so a
@@ -465,9 +516,121 @@ class Model():
             print("=" * 62)
         #! -------------------------------------------------------------------
 
+        #! MULTI-AGENT / STATE ------------------------------------------------
+        #! Starting positions. One per agent, all in the UNSCALED frame and all
+        #! validated against the same bounds as Xe. They must also lie in FREE
+        #! space - that cannot be checked before the first render, so it is
+        #! announced loudly below rather than silently assumed.
+        self.n_agents = int(n_agents)
+        if self.n_agents < 1:
+            raise ValueError("n_agents must be >= 1, got {}".format(n_agents))
+        if starts is None:
+            starts = self.default_starts(self.n_agents, dim)
+        starts = np.asarray(starts, dtype=np.float32).reshape(-1, dim)
+        if starts.shape[0] != self.n_agents:
+            raise ValueError(
+                "got {} start position(s) for {} agent(s): pass exactly "
+                "{} coordinates".format(
+                    starts.shape[0], self.n_agents, self.n_agents * dim))
+        if not np.all(np.isfinite(starts)):
+            raise ValueError("start positions contain NaN/Inf: {}".format(starts))
+        for i, s in enumerate(starts):
+            if not (np.all(s >= self.env_min) and np.all(s <= self.env_max)):
+                raise ValueError(
+                    "start position {} for agent {} is outside the environment "
+                    "bounds {} .. {}".format(
+                        [round(float(v), 4) for v in s], i,
+                        [round(float(v), 2) for v in self.env_min],
+                        [round(float(v), 2) for v in self.env_max]))
+        #! Two agents starting at the same spot is legal but pointless - they
+        #! sense the same frame and the pair degenerates to one slow robot.
+        for i in range(self.n_agents):
+            for j in range(i + 1, self.n_agents):
+                d = float(np.linalg.norm(starts[i] - starts[j]))
+                if d < 1e-6:
+                    raise ValueError(
+                        "agents {} and {} share a start position {} - give "
+                        "each agent a different starting point".format(
+                            i, j, [round(float(v), 4) for v in starts[i]]))
+                if d < 0.05:
+                    print("[MA] WARNING: agents {} and {} start {:.4f} apart - "
+                          "they will sense almost the same frame for a while "
+                          "and the second agent adds little early on".format(
+                              i, j, d))
+        self.starts = starts
+        self.agents = []
+
+        #! Separation preference between agents. DEFAULT 0.0 - i.e. OFF.
+        #!
+        #! Why off by default: the assignment step already guarantees two
+        #! agents never take the SAME frontier, and T(x_i -> f_j) already
+        #! pulls each agent toward its own nearby cluster. A separation term
+        #! on top is a heuristic, and - like speed_weight - it is
+        #! dimensionally inconsistent: it adds a dimensionless proximity
+        #! penalty to a quantity measured in time, so its relative influence
+        #! depends on the scale of the scene rather than on anything physical.
+        #!
+        #! Turn it on (0.1 - 0.5 is a sensible range) if you observe the agents
+        #! trailing each other down the same corridor despite holding distinct
+        #! frontiers.
+        self.sep_weight = float(sep_weight)
+        #! Length scale of that penalty, in world units.
+        self.sep_sigma = float(sep_sigma)
+        if self.sep_sigma <= 0.0:
+            raise ValueError("sep_sigma must be > 0, got {}".format(sep_sigma))
+
+        #! Coverage safety net, previously hardcoded as 0.543. Exposed because
+        #! it is scene-specific AND because N agents reach it in roughly 1/N
+        #! the frames, which otherwise silently confounds a 1-vs-2 agent
+        #! comparison ("who found Xe first" gets tangled with "who hit the
+        #! coverage cap first").
+        self.coverage_limit = float(coverage_limit)
+
+        #! Points sampled per agent per frame. Named because the frame
+        #! buffer's width depends on it (see the padding note in train).
+        self.frame_points_per_agent = 10000
+
+        #! Retire an agent after this many consecutive frames with no frontier
+        #! to claim. Not 1, because the map changes every frame and a frontier
+        #! may free up; not unbounded, because otherwise an all-idle state
+        #! spins until the frame budget runs out.
+        self.idle_limit = 3
+
         self.mode = mode
         self.frame_buffer_size = 20
-        self.camera_steps = 5000//50
+        #! MULTI-AGENT / BUDGET FAIRNESS ---------------------------------------
+        #! Each frame now costs n_agents sensor calls, so comparing "2 agents
+        #! for 100 frames" against "1 agent for 100 frames" hands the pair
+        #! twice the sensing budget and they win trivially. With fair_budget
+        #! the TOTAL number of sensing actions is held constant instead, so an
+        #! A/B run against --baseline measures coordination rather than budget.
+        #! n_agents=1 is unaffected (100 // 1 == 100).
+        self.sensing_budget = 5000//50
+        self.fair_budget = bool(fair_budget)
+        if self.fair_budget:
+            self.camera_steps = max(1, self.sensing_budget // self.n_agents)
+        else:
+            self.camera_steps = self.sensing_budget
+        print("=" * 62)
+        print("[MA] MULTI-AGENT CONFIG")
+        print("[MA]   agents            : {}".format(self.n_agents))
+        for i, s in enumerate(self.starts):
+            print("[MA]   agent {} start     : [{:.4f}, {:.4f}, {:.4f}]".format(
+                i, *[float(v) for v in s]))
+        print("[MA]   frames            : {}  ({} sensing actions total, "
+              "fair_budget={})".format(
+                  self.camera_steps, self.camera_steps * self.n_agents,
+                  self.fair_budget))
+        print("[MA]   separation weight : {:.2f} (sigma {:.3f})".format(
+            self.sep_weight, self.sep_sigma))
+        print("[MA]   coverage limit    : {:.3f}".format(self.coverage_limit))
+        print("[MA]   NOTE: start positions must be in FREE space. This cannot "
+              "be")
+        print("[MA]         verified before the first render - if an agent "
+              "starts")
+        print("[MA]         inside geometry its frames will be garbage.")
+        print("=" * 62)
+        #! ---------------------------------------------------------------------
         self.minimum = 0.007 #0.02
         self.maximum = 0.07  #0.1
         self.all_framedata = None
@@ -479,6 +642,34 @@ class Model():
 
     
     #! Xe CHANGE -------------------------------------------------------------
+    @staticmethod
+    def default_starts(n_agents, dim):
+        """Spread n_agents evenly round the circle through the original start.
+
+        Agent 0 keeps the paper's start (-0.3, -0.2, 0) so a 1-agent run is
+        byte-for-byte the original behaviour. The others are placed at equal
+        angles on the same circle, which puts agent 1 roughly opposite agent 0
+        for the 2-agent case.
+
+        These are GEOMETRIC defaults only: nothing here knows where the walls
+        are, so pass --starts explicitly if a default lands inside geometry.
+        """
+        base = np.array([-0.3, -0.2, 0.0], dtype=np.float32)
+        r = float(np.linalg.norm(base[:2]))
+        a0 = float(np.arctan2(base[1], base[0]))
+        out = []
+        for i in range(n_agents):
+            ang = a0 + 2.0 * np.pi * i / n_agents
+            p = np.zeros(dim, dtype=np.float32)
+            p[0] = r * np.cos(ang)
+            p[1] = r * np.sin(ang)
+            out.append(p)
+        return np.asarray(out, dtype=np.float32)
+
+    def active_agents(self):
+        """Agents still participating (not retired, not finished)."""
+        return [a for a in self.agents if not a.done]
+
     def enemy_speed_factor(self, pts):
         """Multiplicative slow-down factor in [s_min, 1] for points `pts`.
 
@@ -826,16 +1017,20 @@ class Model():
 
     def load_rawdata(self):
         #! load data
-        initial_view = Tensor([-0.3, -0.2, 0])
+        #! MULTI-AGENT: build one Agent per start position. initial_view stays
+        #! as agent 0's start so the existing plotting calls keep working, and
+        #! self.cur_view is kept pointing at agent 0 for the same reason.
+        self.agents = [Agent(i, s) for i, s in enumerate(self.starts)]
+        initial_view = self.agents[0].cur_view.clone()
         self.initial_view = initial_view
-        
+
         if self.mode == READ_FROM_COOKED_DATA: # read from file
             # all_points = np.load("sampled_points.npy")
             # all_speeds = np.load("speed.npy")
             explored_data = np.load("data/explored_data.npy")
             self.explored_data = torch.tensor(explored_data).to(self.Params['Device'])
 
-        self.cur_view = initial_view
+        self.cur_view = self.agents[0].cur_view
 
     def randomize_data(self, frame_data):
         prev_frame_idx = torch.randperm(self.frame_idx).tolist()[:self.frame_buffer_size-1]
@@ -881,172 +1076,313 @@ class Model():
 
         self.load_rawdata()
         is_one_frame = True
-        while True:
-            if True:
-                print("Current Viewpoint:", self.cur_view)
+        total_diff = None
+        cur_data = None
+        frame_data = None
+        stop_reason = "frame budget"
 
-                #! generate data start
-                if self.mode == EXPLORATION:
-                    heights = [0]
-                    curpoints = [] 
-                    curspeeds = []
-                    curbounds = []
-                    for height in heights:
-                        curviewpoint = self.cur_view.clone()
+        while True:
+            #! MULTI-AGENT: agents still participating this frame.
+            active = self.active_agents()
+            if len(active) == 0:
+                stop_reason = "all agents retired"
+                print("[MA] every agent has retired - stopping")
+                break
+            print("Current Viewpoints:", active)
+
+            #! ================= 1. SENSE (once per active agent) =============
+            frames = []   #! list of (agent, points, speeds, bounds)
+            if self.mode == EXPLORATION:
+                for a in active:
+                    curpoints, curspeeds, curbounds = [], [], []
+                    for height in [0]:
+                        curviewpoint = a.cur_view.clone()
                         curviewpoint[2] = height
-                        points, speeds, bounds = igib_runner.sample_points_and_speeds_from_pos_new(self, curviewpoint.cpu().numpy(), self.minimum, self.maximum, num=10000, scale_factor=self.scale_factor)
+                        points, speeds, bounds = igib_runner.sample_points_and_speeds_from_pos_new(
+                            self, curviewpoint.cpu().numpy(), self.minimum,
+                            self.maximum, num=self.frame_points_per_agent,
+                            scale_factor=self.scale_factor)
                         curpoints.append(points)
                         curspeeds.append(speeds)
-                        curbounds.append(bounds)          
-                    frame_points = torch.cat(curpoints, dim=0)
-                    frame_speeds = torch.cat(curspeeds, dim=0)
-                    frame_bounds = torch.cat(curbounds, dim=0)
+                        curbounds.append(bounds)
+                    a_points = torch.cat(curpoints, dim=0)
+                    a_speeds = torch.cat(curspeeds, dim=0)
+                    a_bounds = torch.cat(curbounds, dim=0)
                     #! Xe CHANGE: bake the slow-down zone around Xe into the
                     #! ground-truth speed, so the learned PDE encodes it.
-                    frame_speeds = self.apply_enemy_slowdown(frame_points, frame_speeds)
-                    frame_epoch = 50
+                    a_speeds = self.apply_enemy_slowdown(a_points, a_speeds)
+                    frames.append((a, a_points, a_speeds, a_bounds))
+                frame_epoch = 50
 
-                    #? save occupancy map
-                    # self.occ_map.save(self.folder+"/occ_map.npz")
-                elif self.mode == READ_FROM_COOKED_DATA:
-                    if self.frame_idx >= self.explored_data.shape[0]:
-                        break
-                    heights = [0]
-                    curpoints = [] 
-                    curspeeds = []
-                    curbounds = []         
-                    frame_points = self.explored_data[self.frame_idx, :, :6]
-                    frame_speeds = self.explored_data[self.frame_idx, :, 6:]
-                    #! Xe CHANGE: same slow-down for pre-cooked data
-                    frame_speeds = self.apply_enemy_slowdown(frame_points, frame_speeds)
-                    frame_epoch = 50
+                #? save occupancy map
+                # self.occ_map.save(self.folder+"/occ_map.npz")
+            elif self.mode == READ_FROM_COOKED_DATA:
+                if self.frame_idx >= self.explored_data.shape[0]:
+                    stop_reason = "replay data exhausted"
+                    break
+                a_points = self.explored_data[self.frame_idx, :, :6]
+                a_speeds = self.explored_data[self.frame_idx, :, 6:]
+                #! Xe CHANGE: same slow-down for pre-cooked data
+                a_speeds = self.apply_enemy_slowdown(a_points, a_speeds)
+                frames.append((active[0], a_points, a_speeds, None))
+                frame_epoch = 50
 
+            #! ================= 2. TRAIN (one call, merged frame) ============
+            #! MULTI-AGENT: every active agent's points go into ONE frame.
+            #! Two deliberate reasons:
+            #!   * the gradient-step budget stays identical to the 1-agent
+            #!     baseline - one train_core call of frame_epoch epochs per
+            #!     frame - so an A/B run against --baseline measures
+            #!     coordination rather than extra training;
+            #!   * randomize_data pairs start/end points WITHIN a frame, so
+            #!     merging produces cross-agent point pairs: long-range
+            #!     supervision between two distant regions that a single robot
+            #!     cannot generate on its own.
+            #! Buffer entries grow to n_agents*10000 points but keep a
+            #! consistent shape, and train_core caps at 6 batches per epoch, so
+            #! the per-epoch cost does not change.
+            frame_points = torch.cat([f[1] for f in frames], dim=0)
+            frame_speeds = torch.cat([f[2] for f in frames], dim=0)
+            frame_data = torch.cat(
+                (frame_points.to(self.Params['Device']),
+                 frame_speeds.to(self.Params['Device'])), dim=1)
 
-
-                #! generate data end
-                            
-                frame_data = torch.cat((frame_points.to(self.Params['Device']), frame_speeds.to(self.Params['Device'])), dim=1)
+            #! MULTI-AGENT / BUFFER SHAPE: all_framedata stacks frames with
+            #! unsqueeze(0), so EVERY frame must carry the same number of
+            #! points. It is also saved as a rectangular explored_data.npy and
+            #! replayed row-by-row by READ_FROM_COOKED_DATA. When an agent
+            #! retires mid-run the merged frame would shrink and the next
+            #! torch.cat would raise, so pad back to the full width by
+            #! resampling the observations we DO have this frame. The extra
+            #! rows are duplicates of genuinely sensed points, and train_core
+            #! draws 6 random batches from a pool of hundreds of thousands
+            #! anyway, so the reweighting is negligible.
+            if self.mode == EXPLORATION:
+                width = self.n_agents * self.frame_points_per_agent
+                have = frame_data.shape[0]
+                if have < width:
+                    pad_idx = torch.randint(0, have, (width - have,),
+                                            device=frame_data.device)
+                    frame_data = torch.cat((frame_data, frame_data[pad_idx]), dim=0)
+                    print("[MA] frame padded {} -> {} points ({} of {} agents "
+                          "active)".format(have, width, len(frames), self.n_agents))
 
             ####################! Core Training #############################
             self.alpha = 1.025
             total_diff, cur_data = self.train_core(frame_epoch, frame_data, is_one_frame)
 
-
-
-            #! Policy
+            #! ================= 3. MAP + TERMINATION + POLICY ================
             if self.mode != READ_FROM_COOKED_DATA:
-                # nbv = self.policy_greedy(pre_view, cur_data.detach(), gamma)
-                # nbv = self.policy_handcrafted(frame_idx)
-                traj_list = None
-                if self.mode == EXPLORATION:
-                    #! Update the occupancy grid
-                    #? filter frame points with some z range
-                    valid = (frame_points[:,-1] > -0.1) & (frame_points[:,-1] < 0.1)
-                    self.occ_map.update(self.cur_view.clone().cpu().numpy(), frame_points[valid].cpu().numpy(), frame_bounds[valid].cpu().numpy())
-                    coverage = self.occ_map.get_coverage()
-                    print("Occupancy Grid Coverage:", coverage)
+                #! MULTI-AGENT / MAP: update the SHARED map once per agent,
+                #! each with ITS OWN position. occ_map.update uses `position`
+                #! for the >0.2 good-vs-bad visited test, so one merged call
+                #! carrying a single agent's position would mislabel every
+                #! cell the other agent saw.
+                for a, a_points, a_speeds, a_bounds in frames:
+                    valid = (a_points[:, -1] > -0.1) & (a_points[:, -1] < 0.1)
+                    self.occ_map.update(a.pos(),
+                                        a_points[valid].cpu().numpy(),
+                                        a_bounds[valid].cpu().numpy())
 
-                    #! Xe CHANGE / TERMINATION: the mission is to reach Xe, not
-                    #! to map the scene. Primary stop condition is arrival at
-                    #! the target; coverage is kept only as a safety net so an
-                    #! unreachable Xe cannot loop forever.
-                    cur_np = self.cur_view.detach().clone().cpu().numpy()
-                    #! Xe CHANGE: in baseline mode skip arrival + approach
-                    #! entirely, so termination is coverage-only as in the paper.
-                    if (not self.baseline) and self.has_reached_enemy(
-                            cur_np, radius=self.arrival_radius):
-                        print("[Xe] MISSION COMPLETE - target reached at epoch "
-                              "{} (coverage {:.4f})".format(self.epoch, coverage))
-                        break
+                #! MULTI-AGENT / COVERAGE: one shared map means the union is
+                #! automatic. A cell is covered whichever agent saw it, so
+                #! get_coverage() is already the COMBINED coverage - there is
+                #! nothing to merge. (With per-agent maps the merge would be
+                #! np.maximum on `visited`, since 2 > 1 > 0 is exactly the
+                #! right precedence.)
+                coverage = self.occ_map.get_coverage()
+                print("Occupancy Grid Coverage (combined over {} agent(s)): {}".format(
+                    len(active), coverage))
 
-                    #! Once a route to Xe exists, enable the deceleration zone
-                    #! and head straight for the target instead of exploring.
-                    if (not self.baseline) and (not self.enemy_found):
-                        reachable, _ = self.is_enemy_reachable(cur_np)
+                #! ---- TERMINATION 1: mission. ANY agent reaching Xe ends the
+                #! run for everyone - that is the whole point of sending two.
+                if not self.baseline:
+                    for a in active:
+                        if self.has_reached_enemy(a.pos(), radius=self.arrival_radius):
+                            a.reached = True
+                            print("=" * 62)
+                            print("[Xe] MISSION COMPLETE - agent {} reached the target "
+                                  "at epoch {} (coverage {:.4f})".format(
+                                      a.id, self.epoch, coverage))
+                            print("=" * 62)
+                if any(a.reached for a in self.agents):
+                    stop_reason = "target reached by agent {}".format(
+                        [a.id for a in self.agents if a.reached][0])
+                    break
+
+                #! ---- Route discovery. enemy_found describes the MAP, which
+                #! is shared, so a route found by ANY agent arms APPROACH for
+                #! all of them.
+                if (not self.baseline) and (not self.enemy_found):
+                    for a in active:
+                        reachable, _ = self.is_enemy_reachable(a.pos())
                         if reachable:
-                            print("[Xe] switching from SEARCH to APPROACH")
+                            print("[Xe] switching from SEARCH to APPROACH "
+                                  "(route found by agent {})".format(a.id))
+                            break
 
-                    if coverage > 0.543:
-                        if self.baseline:
-                            print("Coverage limit reached - stopping (baseline).")
-                        else:
-                            print("[Xe] WARNING: coverage limit {:.3f} reached before "
-                                  "arriving at Xe - stopping. The target may be "
-                                  "unreachable or search_weight may be too low "
-                                  "(currently {:.2f}).".format(coverage, self.search_weight))
-                        break
-                    #! Xe CHANGE: once a route to Xe exists, drive straight at
-                    #! the target instead of picking another frontier.
-                    if self.enemy_found:
-                        traj_list = self.path_to_enemy(cur_np, step_size=0.02)
-                        #! Xe CHANGE / STEP FIX: advance by accumulated PATH
-                        #! DISTANCE, mirroring policy_occ, instead of a fixed
-                        #! waypoint count. Waypoint spacing is proportional to
-                        #! the local speed (Eq.11 step is ~ alpha*S), so a fixed
-                        #! count of 4 moves a wildly variable - and near an
-                        #! obstacle or inside a slow-down zone, tiny - distance.
-                        #! A distance budget makes each frame advance the same
-                        #! amount regardless of the local speed.
-                        step_budget = 0.05
-                        traj_ind = 0
-                        accum_dis = 0.0
-                        while accum_dis < step_budget and traj_ind < len(traj_list) - 1:
-                            accum_dis += np.linalg.norm(
-                                traj_list[traj_ind + 1][:2] - traj_list[traj_ind][:2])
-                            traj_ind += 1
-                        print("[Xe] APPROACH: {} waypoints | advanced {:.4f} "
-                              "(budget {:.2f}) -> index {}".format(
-                                  len(traj_list), accum_dis, step_budget, traj_ind))
+                #! ---- TERMINATION 2: coverage safety net, on the shared map.
+                if coverage > self.coverage_limit:
+                    if self.baseline:
+                        print("Coverage limit reached - stopping (baseline).")
                     else:
-                        traj_list, traj_ind = self.policy_occ(
-                            self.cur_view.detach().clone().cpu().numpy(), height=0)
-                    nbv = Tensor(traj_list[traj_ind])
+                        print("[Xe] WARNING: coverage limit {:.3f} reached before "
+                              "arriving at Xe - stopping. The target may be "
+                              "unreachable or search_weight may be too low "
+                              "(currently {:.2f}).".format(coverage, self.search_weight))
+                    stop_reason = "coverage limit {:.3f}".format(coverage)
+                    break
 
-
-                # print("*"*10)
-                # print("self.dataset.Ts[0][:3, 3]/self.scale_factor", self.dataset.Ts[0][:3, 3]/self.scale_factor)
-                print("nbv", nbv)
-                print("curview", self.cur_view)
-                traj = self.predict_trajectory2(self.cur_view.detach().clone().cpu().numpy(), nbv.detach().clone().cpu().numpy())
-                if self.mode == EXPLORATION:
-                    traj = traj_list[:traj_ind+1]
-                if self.trajectory is None:
-                    self.trajectory = traj
+                #! ---- PLAN ----
+                if self.enemy_found:
+                    #! APPROACH: every agent drives straight at Xe. No
+                    #! assignment needed - they share one goal now, and
+                    #! whoever arrives first ends the run.
+                    for a in active:
+                        a.idle = False
+                        a.idle_count = 0
+                        a.traj_list = self.path_to_enemy(a.pos(), step_size=0.02)
+                        #! Xe CHANGE / STEP FIX: advance by accumulated PATH
+                        #! DISTANCE instead of a fixed waypoint count. Waypoint
+                        #! spacing is proportional to the local speed (Eq.11
+                        #! step is ~ alpha*S), so a fixed count moves a wildly
+                        #! variable - and near an obstacle, tiny - distance.
+                        step_budget = 0.05
+                        ti, accum_dis = 0, 0.0
+                        while accum_dis < step_budget and ti < len(a.traj_list) - 1:
+                            accum_dis += np.linalg.norm(
+                                a.traj_list[ti + 1][:2] - a.traj_list[ti][:2])
+                            ti += 1
+                        a.traj_ind = ti
+                        print("[Xe] APPROACH agent {}: {} waypoints | advanced "
+                              "{:.4f} (budget {:.2f}) -> index {}".format(
+                                  a.id, len(a.traj_list), accum_dis, step_budget, ti))
                 else:
-                    self.trajectory = np.concatenate([self.trajectory, traj], axis=0) 
-                print("traj is:", traj)
-                
-                
+                    #! SEARCH: one DISTINCT frontier per agent. Without this
+                    #! assignment both agents score frontiers identically
+                    #! (only T(x_i -> f_j) differs) and converge on the same
+                    #! one, making the second robot pure waste.
+                    picks, diag = self.assign_frontiers(active, height=0)
+                    if diag is None:
+                        #! no frontiers anywhere - the sweep is finished
+                        for a in active:
+                            a.done = True
+                        stop_reason = "no frontiers left"
+                        print("[MA] no frontiers left for any agent - stopping")
+                        break
+                    for a, target in zip(active, picks):
+                        if target is None:
+                            #! Fewer frontiers than agents this frame. Idle
+                            #! rather than retire immediately: the map changes
+                            #! every frame and one may free up. Retire only
+                            #! after idling IDLE_LIMIT frames in a row, which
+                            #! also stops an all-idle stall from spinning.
+                            a.idle = True
+                            a.idle_count += 1
+                            a.traj_list = None
+                            a.traj_ind = 0
+                            if a.idle_count >= self.idle_limit:
+                                a.done = True
+                                print("[MA] agent {} retired - idle {} frames "
+                                      "in a row".format(a.id, a.idle_count))
+                            continue
+                        a.idle = False
+                        a.idle_count = 0
+                        a.traj_list, a.traj_ind, accum_dis = self.plan_to_target(
+                            a.pos(), target, height=0)
+                        print("[MA]   agent {} advanced {:.4f} -> traj index {} "
+                              "of {}".format(a.id, accum_dis, a.traj_ind,
+                                             len(a.traj_list)))
+
+                #! ---- MOVE: record the stretch each agent walks this frame.
+                for a in active:
+                    if a.traj_list is None or a.idle:
+                        continue
+                    a.nbv = Tensor(a.traj_list[a.traj_ind])
+                    #! NOTE: the original also called predict_trajectory2 here
+                    #! and then immediately overwrote the result with
+                    #! traj_list[:traj_ind+1]. That call was dead work - a full
+                    #! bidirectional descent per frame - so it is gone.
+                    walked = a.traj_list[:a.traj_ind + 1]
+                    if a.trajectory is None:
+                        a.trajectory = walked
+                    else:
+                        a.trajectory = np.concatenate([a.trajectory, walked], axis=0)
+                    print("agent {} nbv {} <- curview {}".format(
+                        a.id, a.nbv, a.cur_view))
+
                 #? ******************SAVINGS start*******************
-                save_traj = False 
+                save_traj = False
                 if save_traj:
-                    np.save(self.folder+"/traj"+"_"+str(self.epoch)+".npy", self.trajectory)
+                    for a in self.agents:
+                        if a.trajectory is not None:
+                            np.save("{}/traj_agent{}_{}.npy".format(
+                                self.folder, a.id, self.epoch), a.trajectory)
 
+                #! back-compat aliases for anything reading the single-agent
+                #! attributes (plot, eval scripts)
+                self.cur_view = self.agents[0].cur_view
+                self.trajectory = self.agents[0].trajectory
 
-                
                 camera_matrix = None
-                self.plot(self.initial_view, nbv, self.epoch, total_diff.item(),self.alpha, cur_data[:,:6].clone().cpu().numpy(), camera_matrix, traj_list)
+                lead = self.agents[0]
+                self.plot(self.initial_view,
+                          lead.nbv if lead.nbv is not None else self.initial_view,
+                          self.epoch, total_diff.item(), self.alpha,
+                          cur_data[:, :6].clone().cpu().numpy(), camera_matrix,
+                          lead.traj_list, agents=self.agents)
 
             elif self.mode == READ_FROM_COOKED_DATA:
-                self.plot(self.initial_view, np.array([0.3, 0.2, 0]), self.epoch, total_diff.item(),self.alpha, cur_data[:,:6].clone().cpu().numpy(), None)
+                self.plot(self.initial_view, np.array([0.3, 0.2, 0]), self.epoch,
+                          total_diff.item(), self.alpha,
+                          cur_data[:, :6].clone().cpu().numpy(), None)
 
-            
-            # self.fourplot(epoch, FRAMES[:frame_idx+1], total_diff.item(), alpha)
             with torch.no_grad():
                 self.save(epoch=self.epoch, val_loss=total_diff)
 
             #? ******************SAVINGS end*******************
-            
+
+            #! ---- commit the moves ----
+            if self.mode != READ_FROM_COOKED_DATA:
+                for a in active:
+                    if a.nbv is not None and not a.idle:
+                        a.cur_view = a.nbv
+                self.cur_view = self.agents[0].cur_view
+
+            #! ---- TERMINATION 3: every agent retired ----
+            if all(a.done for a in self.agents):
+                stop_reason = "all agents retired"
+                print("[MA] every agent has retired - stopping")
+                break
+
+            #! ---- TERMINATION 4: frame budget ----
             self.frame_idx += 1
             if self.frame_idx >= self.camera_steps:
+                stop_reason = "frame budget ({} frames x {} agents = {} sensing actions)".format(
+                    self.camera_steps, self.n_agents,
+                    self.camera_steps * self.n_agents)
+                print("[MA] " + stop_reason + " - stopping")
                 break
-            
-            if self.mode != READ_FROM_COOKED_DATA:
-                self.cur_view = nbv
+
+        #! ================= SUMMARY =================
+        print("=" * 62)
+        print("[MA] EXPLORATION FINISHED - {}".format(stop_reason))
+        print("[MA]   frames            : {}".format(self.frame_idx))
+        print("[MA]   sensing actions   : {}".format(self.frame_idx * self.n_agents))
+        print("[MA]   combined coverage : {:.4f}".format(self.occ_map.get_coverage()))
+        print("[MA]   route to Xe found : {}".format(self.enemy_found))
+        for a in self.agents:
+            walked = 0.0
+            if a.trajectory is not None and len(a.trajectory) > 1:
+                walked = float(np.linalg.norm(
+                    np.diff(np.asarray(a.trajectory)[:, :2], axis=0), axis=1).sum())
+            print("[MA]   agent {}: {} | path length {:.4f}".format(a.id, a, walked))
+        print("=" * 62)
 
         if True:
             print("Exploration is done. Finetuning...")
-            self.plot(self.cur_view, self.cur_view, self.epoch, total_diff.item(),self.alpha)
+            self.plot(self.cur_view, self.cur_view, self.epoch, total_diff.item(),
+                      self.alpha, agents=self.agents)
             #?: train for another 1000 epochs for finetuning
             # 1. data is all framedata
             prev_frame_idx = torch.randperm(self.frame_idx).tolist()[:self.frame_buffer_size-1]
@@ -1075,7 +1411,8 @@ class Model():
             total_diff, cur_data = self.train_core(fine_epoch, fine_data, False)
 
             # 3. save a final plot #
-            self.plot(self.cur_view, self.cur_view, self.epoch, total_diff.item(),self.alpha)
+            self.plot(self.cur_view, self.cur_view, self.epoch, total_diff.item(),
+                      self.alpha, agents=self.agents)
             with torch.no_grad():
                 self.save(epoch=self.epoch, val_loss=total_diff)
 
@@ -1394,7 +1731,11 @@ class Model():
         return Ypred
 
 
-    def plot(self, src, tar, epoch, total_train_loss, alpha, cur_points=None, camera_matrix=None, traj_list = None):
+    #! MULTI-AGENT: per-agent colours for trajectories and position markers.
+    AGENT_COLORS = ['red', 'deepskyblue', 'lime', 'orange', 'magenta', 'yellow']
+
+    def plot(self, src, tar, epoch, total_train_loss, alpha, cur_points=None,
+             camera_matrix=None, traj_list=None, agents=None):
         limit = 1
         xmin = [-0.5, -0.5]
         xmax = [0.5, 0.5]
@@ -1464,6 +1805,26 @@ class Model():
             # np.save(traj_list_path, traj_list)
             plt.savefig(self.folder+"/plots"+str(epoch)+"_"+str(alpha)+"_"+str(round(total_train_loss,4))+"_0.png",bbox_inches='tight')
 
+        #! MULTI-AGENT: one coloured walked-path per agent, plus a labelled
+        #! marker at each agent's current position. Falls back to the original
+        #! single red path when no agent list is supplied.
+        if agents is not None:
+            for a in agents:
+                c = self.AGENT_COLORS[a.id % len(self.AGENT_COLORS)]
+                if a.trajectory is not None and len(a.trajectory) > 0:
+                    tr = np.asarray(a.trajectory)
+                    ax.plot(tr[:, 0], tr[:, 1], color=c, marker='o',
+                            markersize=0.8, linestyle='-', linewidth=1,
+                            label='agent {}'.format(a.id))
+                p = a.pos()
+                ax.plot(p[0], p[1], marker='o', color=c, markersize=7,
+                        markeredgecolor='white', markeredgewidth=1.0,
+                        zorder=6, linestyle='None')
+                ax.annotate(str(a.id), (p[0], p[1]), color='white',
+                            fontsize=6, ha='center', va='center', zorder=7)
+            if any(a.trajectory is not None for a in agents):
+                ax.legend(loc='upper right', fontsize=6, framealpha=0.6)
+        elif traj_list is not None and self.trajectory is not None:
             #? plot trajectory with step size
             ax.plot(self.trajectory[:, 0], self.trajectory[:, 1], color='red', marker='o', markersize=0.8, linestyle='-', linewidth=1)
             
@@ -1486,9 +1847,14 @@ class Model():
         # draw occupancy grid
         if self.mode in [EXPLORATION]:
             pathname = self.folder+"/plots"+str(epoch)+"_"+"occ"+".png"
-            cur_small_loc = src.cpu().numpy()
-            tar_small_loc = tar.cpu().numpy()
-            self.occ_map.plot(cur_small_loc, tar_small_loc, path=pathname)
+            cur_small_loc = src.cpu().numpy() if torch.is_tensor(src) else np.asarray(src)
+            tar_small_loc = tar.cpu().numpy() if torch.is_tensor(tar) else np.asarray(tar)
+            #! MULTI-AGENT: mark every agent on the occupancy grid, not just
+            #! the one that happens to be `src`.
+            agent_locs = ([a.pos() for a in agents] if agents is not None
+                          else None)
+            self.occ_map.plot(cur_small_loc, tar_small_loc, path=pathname,
+                              agent_locs=agent_locs)
             
 
         if cur_points is not None:
@@ -1576,131 +1942,236 @@ class Model():
 
         return traj.detach().cpu().numpy()
     
-    def policy_occ(self, current_location, height):
-        # curtargetblock = self.occ_map.get_target_block()
-        # if not curtargetblock:
-        #     return Variable(Tensor([0, 0, height])).cpu()
-        # curtargetloc = self.occ_map.get_block_center(curtargetblock)
-        possible_locs = self.occ_map.get_block_centers()
-        if True:
-            #? find the shortest path one
-            #! Xe CHANGE / SEARCH PRIORITY: the objective is FINDING Xe, not
-            #! maximising coverage. Each candidate frontier is scored by
-            #!     score = T(robot -> frontier) + search_weight * T(frontier -> Xe)
-            #! The first term keeps the choice reachable/cheap (the paper's
-            #! behaviour); the second pulls the sweep toward the target.
-            #! search_weight = 0 reproduces the original coverage sweep.
+    def score_frontiers(self, agents, possible_locs, height):
+        """Cost matrix for assigning frontiers to agents.
 
-            #! (a) cost from the robot to each frontier
-            XP = np.zeros((len(possible_locs),3*self.dim))
-            XP[:,:self.dim] = current_location
-            XP[:,self.dim:self.dim+2] = possible_locs
-            XP[:,self.dim+2] = height
-            XP[:,2*self.dim:3*self.dim] = self.Xe
-            XP = Variable(Tensor(XP)).to(self.Params['Device'])
-            tt_to_frontier = self.TravelTimes(XP).to('cpu').data.numpy()
+            score[i, j] = T(x_i -> f_j)                       reachable / cheap
+                        + search_weight * T(f_j -> Xe)        pull toward target
+                        + speed_weight  * (1 - S(f_j))        endpoint openness
+                        + sep_weight    * proximity to other agents
 
-            #! (b) cost from each frontier onward to Xe.
-            #! Xe CHANGE / ZERO-WEIGHT FIX: when the weight is 0 we SKIP this
-            #! entirely rather than computing it and multiplying by zero.
-            #! TravelTimes can return inf for an unreachable frontier, and
-            #! 0.0 * inf = NaN in IEEE arithmetic - which then wins argmin and
-            #! selects a garbage frontier. Skipping is both correct and cheaper
-            #! (it also avoids a whole forward pass).
-            if self.search_weight != 0.0:
-                XPe = np.zeros((len(possible_locs),3*self.dim))
-                XPe[:,:self.dim] = XP[:,self.dim:2*self.dim].cpu().numpy()
-                XPe[:,self.dim:2*self.dim] = self.Xe
-                XPe[:,2*self.dim:3*self.dim] = self.Xe
-                XPe = Variable(Tensor(XPe)).to(self.Params['Device'])
-                tt_to_enemy = self.TravelTimes(XPe).to('cpu').data.numpy()
-            else:
-                tt_to_enemy = np.zeros(len(possible_locs))
+        The first three terms are exactly the single-agent objective. Note
+        that terms 2 and 3 are IDENTICAL for every agent - only T(x_i -> f_j)
+        distinguishes them - which is precisely why independent argmin per
+        agent makes both robots pick the same frontier, and why the assignment
+        step in assign_frontiers is needed rather than optional.
 
-            #! (c) predicted SPEED at each frontier - same network, same
-            #! forward pass, no extra machinery. Speed() evaluates at the goal
-            #! block, which is the frontier here.
-            #! Xe CHANGE / ZERO-WEIGHT FIX: same reasoning - skip the Speed()
-            #! forward+backward pass entirely when the weight is 0.
-            if self.speed_weight != 0.0:
-                s_frontier = self.Speed(XP).to('cpu').data.numpy()
-            else:
-                s_frontier = np.ones(len(possible_locs))
-            #! Xe CHANGE / NaN FIX: Speed() is 1/sqrt(S) and S can reach 0 or
-            #! go slightly negative early in training, giving inf/NaN. np.clip
-            #! does NOT remove NaN, and np.argmin then RETURNS THE NaN INDEX -
-            #! i.e. the robot silently picks an arbitrary frontier. Replace
-            #! non-finite values before clipping.
-            s_frontier = np.nan_to_num(s_frontier, nan=0.0,
-                                       posinf=1.0, neginf=0.0)
-            s_frontier = np.clip(s_frontier, 0.0, 1.0)
+        Everything is evaluated in ONE batched forward pass over all
+        n_agents x n_frontiers rows: centralising the planning is cheaper here
+        than running it per agent, not more expensive.
+        """
+        n = len(agents)
+        m = len(possible_locs)
+        dev = self.Params['Device']
+        locs = np.asarray(possible_locs, dtype=np.float32).reshape(m, -1)[:, :2]
 
-            #! Xe CHANGE / NaN FIX: the time terms can also be non-finite
-            #! before the field has converged. Map them to +inf so they are
-            #! never selected, rather than letting NaN win the argmin.
-            n_bad = int((~np.isfinite(tt_to_frontier)).sum()
-                        + (~np.isfinite(tt_to_enemy)).sum())
-            if n_bad > 0:
-                print("[Xe] WARNING: {} non-finite arrival times among {} "
-                      "frontiers - excluded from selection".format(
-                          n_bad, len(possible_locs)))
-            big = 1e6
-            tt_to_frontier = np.nan_to_num(tt_to_frontier, nan=big,
-                                           posinf=big, neginf=big)
-            tt_to_enemy = np.nan_to_num(tt_to_enemy, nan=big,
-                                        posinf=big, neginf=big)
+        #! (a) cost from each agent to each frontier - all N*M rows at once
+        XP = np.zeros((n * m, 3 * self.dim), dtype=np.float32)
+        for i, a in enumerate(agents):
+            sl = slice(i * m, (i + 1) * m)
+            XP[sl, :self.dim] = a.pos()[:self.dim]
+            XP[sl, self.dim:self.dim + 2] = locs
+            XP[sl, self.dim + 2] = height
+            XP[sl, 2 * self.dim:3 * self.dim] = self.Xe
+        XPt = Variable(Tensor(XP)).to(dev)
+        tt_to_frontier = self.TravelTimes(XPt).to('cpu').data.numpy().reshape(n, m)
 
-            #! (d) combined objective: low arrival time, low remaining time to
-            #! Xe, and HIGH speed at the chosen viewpoint.
-            score = (tt_to_frontier
-                     + self.search_weight * tt_to_enemy
-                     + self.speed_weight * (1.0 - s_frontier))
-            small_idx = np.argmin(score)
-            curtargetloc_small = possible_locs[small_idx]
+        #! (b) cost from each frontier onward to Xe. Agent-independent, so it
+        #! is computed once over M rows rather than N*M.
+        #! Xe CHANGE / ZERO-WEIGHT FIX: when the weight is 0 we SKIP this
+        #! entirely rather than computing it and multiplying by zero.
+        #! TravelTimes can return inf for an unreachable frontier, and
+        #! 0.0 * inf = NaN in IEEE arithmetic - which then wins argmin and
+        #! selects a garbage frontier. Skipping is both correct and cheaper.
+        if self.search_weight != 0.0:
+            XPe = np.zeros((m, 3 * self.dim), dtype=np.float32)
+            XPe[:, :self.dim] = XP[:m, self.dim:2 * self.dim]
+            XPe[:, self.dim:2 * self.dim] = self.Xe
+            XPe[:, 2 * self.dim:3 * self.dim] = self.Xe
+            XPe = Variable(Tensor(XPe)).to(dev)
+            tt_to_enemy = self.TravelTimes(XPe).to('cpu').data.numpy()
+        else:
+            tt_to_enemy = np.zeros(m, dtype=np.float32)
 
-            print("[Xe] policy_occ: {} frontiers | w_target={:.2f} w_speed={:.2f}".format(
-                      len(possible_locs), self.search_weight, self.speed_weight))
-            print("[Xe]   chosen #{}: T_frontier={:.4f}  T_to_Xe={:.4f}  "
-                  "S_frontier={:.3f}  ->  score={:.4f}".format(
-                      int(small_idx),
-                      float(tt_to_frontier[small_idx]),
-                      float(tt_to_enemy[small_idx]),
-                      float(s_frontier[small_idx]),
-                      float(score[small_idx])))
-            print("[Xe]   pool: best T_to_Xe={:.4f}  fastest S={:.3f}  "
-                  "slowest S={:.3f}".format(
-                      float(tt_to_enemy.min()), float(s_frontier.max()),
-                      float(s_frontier.min())))
-        
-        print("current location :", current_location)
-        print("target location :", curtargetloc_small)
-        print("block idx:", self.occ_map.block_stack[small_idx])
+        #! (c) predicted SPEED at each frontier - same network, same rows.
+        if self.speed_weight != 0.0:
+            s_frontier = self.Speed(XPt).to('cpu').data.numpy().reshape(n, m)
+        else:
+            s_frontier = np.ones((n, m), dtype=np.float32)
+        #! Xe CHANGE / NaN FIX: Speed() is 1/sqrt(S) and S can reach 0 or go
+        #! slightly negative early in training, giving inf/NaN. np.clip does
+        #! NOT remove NaN, and np.argmin then RETURNS THE NaN INDEX - i.e. the
+        #! robot silently picks an arbitrary frontier. Replace non-finite
+        #! values before clipping.
+        s_frontier = np.nan_to_num(s_frontier, nan=0.0, posinf=1.0, neginf=0.0)
+        s_frontier = np.clip(s_frontier, 0.0, 1.0)
 
-        #！ set a step size
-        curtargetloc_small = np.concatenate([curtargetloc_small, [height]])
-        curtargetloc_small_tensor = torch.from_numpy(curtargetloc_small).float()
-        
-        curloc_tensor = torch.from_numpy(current_location).float()
+        #! Xe CHANGE / NaN FIX: the time terms can also be non-finite before
+        #! the field has converged. Map them to a large finite value so they
+        #! are never selected, rather than letting NaN win the argmin.
+        n_bad = int((~np.isfinite(tt_to_frontier)).sum()
+                    + (~np.isfinite(tt_to_enemy)).sum())
+        if n_bad > 0:
+            print("[Xe] WARNING: {} non-finite arrival times among {} "
+                  "agent-frontier pairs - excluded from selection".format(
+                      n_bad, n * m))
+        big = 1e6
+        tt_to_frontier = np.nan_to_num(tt_to_frontier, nan=big,
+                                       posinf=big, neginf=big)
+        tt_to_enemy = np.nan_to_num(tt_to_enemy, nan=big, posinf=big, neginf=big)
 
-        traj_list = self.predict_trajectory2(curloc_tensor, curtargetloc_small_tensor, step_size=0.02)
+        #! (d) MULTI-AGENT: separation preference. Penalise frontiers that sit
+        #! close to ANOTHER agent's current position, so the robots fan out
+        #! instead of trailing each other down one corridor. Off by default -
+        #! see the sep_weight comment in __init__ for why.
+        sep = np.zeros((n, m), dtype=np.float32)
+        if self.sep_weight != 0.0 and n > 1:
+            for i in range(n):
+                for k, b in enumerate(agents):
+                    if k == i:
+                        continue
+                    d = np.linalg.norm(locs - b.pos()[:2][None, :], axis=1)
+                    sep[i] += np.exp(-d / self.sep_sigma)
 
-        # find the largest point that is smaller than the step size
-        if True:
-            #? accumulate the distance to fit the step size
-            step_size = 0.05
-            index = 0
-            curtargetloc = traj_list[-1]
-            accum_dis = 0
-            while accum_dis < step_size:
-                curtargetloc = traj_list[index]
-                accum_dis += np.linalg.norm(traj_list[index+1][:2] - traj_list[index][:2])
-                index += 1
-                if index >= len(traj_list)-1:
+        score = (tt_to_frontier
+                 + self.search_weight * tt_to_enemy[None, :]
+                 + self.speed_weight * (1.0 - s_frontier)
+                 + self.sep_weight * sep)
+        return score, tt_to_frontier, tt_to_enemy, s_frontier
+
+    @staticmethod
+    def solve_assignment(score):
+        """Minimum-cost assignment of frontiers (columns) to agents (rows).
+
+        Returns a list of length n_agents: the frontier index for each agent,
+        or -1 when there was no frontier left to give it (fewer frontiers than
+        agents).
+
+        Exact and dependency-free for the 1- and 2-agent cases. For N > 2 it
+        uses scipy's Hungarian solver when importable, otherwise sequential
+        greedy - the standard choice in multi-robot frontier exploration, and
+        within a factor of 2 of optimal for this kind of coverage objective.
+        """
+        n, m = score.shape
+        if m == 0:
+            return [-1] * n
+        if n == 1:
+            return [int(np.argmin(score[0]))]
+        if n == 2 and m >= 2:
+            #! Exact for two agents: minimise score[0,i] + score[1,j] over
+            #! i != j. M^2 is at most a few hundred thousand entries here, so
+            #! brute force is both optimal and instant - no scipy needed.
+            total = score[0][:, None] + score[1][None, :]
+            np.fill_diagonal(total, np.inf)   #! both taking the same frontier
+            i, j = np.unravel_index(int(np.argmin(total)), total.shape)
+            return [int(i), int(j)]
+        try:
+            from scipy.optimize import linear_sum_assignment
+            rows, cols = linear_sum_assignment(score)
+            out = [-1] * n
+            for r, c in zip(rows, cols):
+                out[int(r)] = int(c)
+            return out
+        except ImportError:
+            pass
+        #! sequential greedy: most-constrained agent picks first
+        out = [-1] * n
+        taken = set()
+        for i in np.argsort(score.min(axis=1)):
+            for j in np.argsort(score[int(i)]):
+                if int(j) not in taken:
+                    out[int(i)] = int(j)
+                    taken.add(int(j))
                     break
-            print("accumulated distance:", accum_dis, "at traj_index:", index)
-            print("Target location after gradient descent:", curtargetloc)
-            print("Length of traj_list:", len(traj_list))
+        return out
 
-        #! should return a list of trajectory, and index of the end traj
-        # return Variable(Tensor(curtargetloc)).cpu()
-        return traj_list, index - 1
+    def assign_frontiers(self, agents, height):
+        """Pick one distinct frontier per agent from the SHARED occupancy map.
+
+        Returns (picks, diag) where picks is a list parallel to `agents` of
+        (x, y) frontier coordinates, or None for an agent that could not be
+        given one.
+        """
+        possible_locs = self.occ_map.get_block_centers()
+        m = len(possible_locs)
+        #! MULTI-AGENT / CRASH FIX: np.argmin raises on an empty array, and
+        #! get_block_centers() legitimately returns empty once the sweep is
+        #! finished. This was already latent for one agent at the end of a run;
+        #! with claiming it happens routinely to the second agent.
+        if m == 0:
+            print("[MA] no frontiers left - every active agent retires")
+            return [None] * len(agents), None
+
+        score, tt_f, tt_e, s_f = self.score_frontiers(agents, possible_locs, height)
+        picks_idx = self.solve_assignment(score)
+
+        print("[MA] assigning {} frontier(s) to {} agent(s) "
+              "| w_target={:.2f} w_speed={:.2f} w_sep={:.2f}".format(
+                  m, len(agents), self.search_weight, self.speed_weight,
+                  self.sep_weight))
+        picks = []
+        for i, a in enumerate(agents):
+            j = picks_idx[i]
+            if j < 0:
+                picks.append(None)
+                print("[MA]   agent {}: NO FREE FRONTIER "
+                      "({} frontier(s) for {} agent(s)) - idle this frame".format(
+                          a.id, m, len(agents)))
+                continue
+            picks.append(np.asarray(possible_locs[j], dtype=np.float32))
+            print("[MA]   agent {} -> frontier #{} {} | T_f={:.4f} "
+                  "T_to_Xe={:.4f} S={:.3f} -> score={:.4f}".format(
+                      a.id, int(j),
+                      [round(float(v), 3) for v in possible_locs[j]],
+                      float(tt_f[i, j]), float(tt_e[j]), float(s_f[i, j]),
+                      float(score[i, j])))
+        #! Sanity: the assignment must hand out distinct frontiers.
+        claimed = [j for j in picks_idx if j >= 0]
+        assert len(claimed) == len(set(claimed)), \
+            "assignment gave the same frontier to two agents: {}".format(picks_idx)
+        return picks, {'score': score, 'tt_frontier': tt_f,
+                       'tt_enemy': tt_e, 'speed': s_f, 'idx': picks_idx}
+
+    def plan_to_target(self, current_location, target_xy, height, step_size=0.05):
+        """Plan toward a frontier and advance by an accumulated DISTANCE budget.
+
+        Returns (traj_list, index) with the same semantics as the original
+        policy_occ: traj_list[:index+1] is the stretch to walk this frame.
+        """
+        target = np.concatenate([
+            np.asarray(target_xy, dtype=np.float32).reshape(-1)[:2],
+            np.array([height], dtype=np.float32)])
+        tar_t = torch.from_numpy(target).float()
+        cur_t = torch.from_numpy(
+            np.asarray(current_location, dtype=np.float32).reshape(-1)[:self.dim]).float()
+
+        traj_list = self.predict_trajectory2(cur_t, tar_t, step_size=0.02)
+
+        #? accumulate the distance to fit the step size
+        index = 0
+        accum_dis = 0.0
+        while accum_dis < step_size and index < len(traj_list) - 1:
+            accum_dis += np.linalg.norm(
+                traj_list[index + 1][:2] - traj_list[index][:2])
+            index += 1
+        return traj_list, max(index - 1, 0), accum_dis
+
+    def policy_occ(self, current_location, height):
+        """Single-agent frontier choice - unchanged interface.
+
+        Kept so a 1-agent run, and any external caller, behave exactly as
+        before. The multi-agent path goes through assign_frontiers instead.
+        Returns (None, 0) when no frontier is left, where the original raised
+        inside np.argmin.
+        """
+        probe = Agent(0, np.asarray(
+            current_location, dtype=np.float32).reshape(-1)[:self.dim])
+        picks, _ = self.assign_frontiers([probe], height)
+        if picks[0] is None:
+            return None, 0
+        traj_list, index, accum = self.plan_to_target(
+            current_location, picks[0], height)
+        print("current location :", current_location)
+        print("target location :", picks[0])
+        print("accumulated distance:", accum, "at traj_index:", index)
+        return traj_list, index

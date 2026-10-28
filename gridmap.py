@@ -225,9 +225,24 @@ class OccupancyGridMap:
             coordinates.append(self.get_coordinates_from_index(x, y))
         return numpy.array(coordinates)
 
-    def plot(self, curloc, targetloc, alpha=1, origin='lower', path=None):
+    #! MULTI-AGENT: matches Model.AGENT_COLORS so the two figures agree.
+    AGENT_RGB = [
+        (1.0, 0.0, 0.0),        # red
+        (0.0, 0.75, 1.0),       # deepskyblue
+        (0.0, 1.0, 0.0),        # lime
+        (1.0, 0.65, 0.0),       # orange
+        (1.0, 0.0, 1.0),        # magenta
+        (1.0, 1.0, 0.0),        # yellow
+    ]
+
+    def plot(self, curloc, targetloc, alpha=1, origin='lower', path=None,
+             agent_locs=None):
         """
         Plot the grid map with different colors based on visit status.
+
+        :param agent_locs: optional list of (x, y, z) agent positions. When
+            given, every agent is marked in its own colour instead of only the
+            single `curloc` cell.
         """
         # Create a color map: 0 - grey, 1 - red, 2 - black/white based on occupancy
         colored_map = numpy.empty((*self.dim_cells, 3))
@@ -250,6 +265,19 @@ class OccupancyGridMap:
         targeti,targetj = self.get_index_from_coordinates(targetloc[0],targetloc[1])
         print("targetij: ", targeti, targetj)
         colored_map[targetj,targeti] = [255/255,20/255,147/255]
+
+        #! MULTI-AGENT: paint a 3x3 patch per agent so it stays visible at
+        #! this grid resolution, in the same colour the velocity plot uses.
+        if agent_locs is not None:
+            for aid, loc in enumerate(agent_locs):
+                ai, aj = self.get_index_from_coordinates(loc[0], loc[1])
+                rgb = self.AGENT_RGB[aid % len(self.AGENT_RGB)]
+                for di in (-1, 0, 1):
+                    for dj in (-1, 0, 1):
+                        ii, jj = ai + di, aj + dj
+                        if self.is_inside_idx((ii, jj)):
+                            colored_map[jj, ii] = list(rgb)
+                print("agent {} ij: {} {}".format(aid, ai, aj))
 
         if True: # plot the centers of the blocks
             centers = self.get_block_centers()
